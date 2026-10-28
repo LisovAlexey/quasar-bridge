@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -34,6 +36,7 @@ func main() {
 	check := flag.Bool("check-backends", false, "check LLM and configured Home Assistant connectivity")
 	checkMCP := flag.Bool("check-mcp", false, "connect to configured MCP servers and list tools without executing them")
 	route := flag.String("route", "", "explain a route without executing home actions or generating an answer")
+	claim := flag.Bool("claim", false, "simulate a daemon control claim before -route/-query (diagnostics)")
 	validate := flag.Bool("check-config", false, "validate configuration without contacting backends")
 	speakerAction := flag.String("speaker-endpoint", "", "apply or rollback the on-device loopback endpoint (requires writable firmware)")
 	speakerConfig := flag.String("speaker-config", "/system/vendor/quasar/quasar.cfg", "firmware configuration path")
@@ -189,6 +192,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 		defer cancel()
 		if *route != "" {
+			if *claim {
+				engine.Claim(false)
+			}
 			data, _ := json.Marshal(engine.Decide(ctx, *route))
 			fmt.Println(string(data))
 			return
@@ -210,6 +216,9 @@ func main() {
 			}
 			fmt.Printf("LLM: ok; Home Assistant: %d entities\n", len(entities))
 			return
+		}
+		if *claim {
+			engine.Claim(false)
 		}
 		r, err := engine.Resolve(ctx, *query)
 		if err != nil {
@@ -269,11 +278,32 @@ func main() {
 			}
 		}
 	}
+	// Local control endpoint token: the wake-word daemon authenticates with this to
+	// force a "Клод" conversation onto the LLM. Absent token disables the endpoint.
+	controlToken := os.Getenv("QUASAR_CONTROL_TOKEN")
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		state := engine.RoutingStatus()
-		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil})
+		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "control_enabled": controlToken != ""})
 		_, _ = w.Write(data)
+	})
+	// Local control endpoint: the wake-word daemon POSTs here on a "Клод" wake to
+	// force the next conversation onto the LLM. Loopback only (allowed_ips) and
+	// guarded by a bearer token from QUASAR_CONTROL_TOKEN; absent token disables it.
+	mux.HandleFunc("POST /control/claim", func(w http.ResponseWriter, r *http.Request) {
+		if controlToken == "" {
+			http.Error(w, "control endpoint disabled", http.StatusServiceUnavailable)
+			return
+		}
+		presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		want := sha256.Sum256([]byte(controlToken))
+		got := sha256.Sum256([]byte(presented))
+		if subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		engine.Claim(r.URL.Query().Get("new_chat") == "1")
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.Handle("/uni.ws", proxy)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

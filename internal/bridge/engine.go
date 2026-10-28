@@ -38,6 +38,28 @@ type Engine struct {
 	Dialogue     *dialogue.Store
 	dialogueOnce sync.Once
 	routing      atomic.Pointer[RoutingPolicy]
+	// claimUntil/claimNewChat mark that the next routing decision must go to the
+	// LLM regardless of the recognized text; set by the wake-word daemon over the
+	// local control endpoint right before it opens a "Клод" conversation. The claim
+	// is per-wake and single-shot: multi-turn continuity comes from short-term
+	// memory, not a sticky route, so a following "Алиса" is never captured.
+	claimUntil   atomic.Int64 // unix nanoseconds, 0 = no pending claim
+	claimNewChat atomic.Bool
+	// lastLLM records whether the previous turn was answered by the LLM. A bare
+	// elliptical follow-up ("а вчера?") is only auto-routed to the LLM when it is,
+	// so an Alice turn in between does not pull later cloud follow-ups into Claude
+	// even though the Claude chat's memory is kept for an explicit "Клод" turn.
+	lastLLM atomic.Bool
+}
+
+const claimWindow = 15 * time.Second // how long a claim waits for the next decision
+
+// Claim forces the next routing decision (within claimWindow) onto the LLM path,
+// bypassing text rules and the classifier, for one turn. newChat clears prior
+// short-term memory before answering. Called by the wake-word daemon.
+func (e *Engine) Claim(newChat bool) {
+	e.claimNewChat.Store(newChat)
+	e.claimUntil.Store(time.Now().Add(claimWindow).UnixNano())
 }
 
 func (e *Engine) dialogue() *dialogue.Store {
@@ -86,9 +108,10 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		}
 		return Resolution{Route: "llm", Answer: "Начинаем новый разговор."}, nil
 	}
-	if route != "llm" && !e.dialogue().Clear(ctx, ticket) {
-		return Resolution{Route: route}, context.Canceled
-	}
+	// Note: a non-LLM turn (Alice/home) deliberately does NOT clear the dialogue
+	// memory, so an "Алиса …" between two "Клод" turns keeps the Claude chat going.
+	// Only "начни новый разговор" (dialogue_reset, above) clears it. Staleness was
+	// already checked at the top of this function.
 	result := Resolution{Route: route}
 	switch route {
 	case "music":
@@ -168,6 +191,7 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 	r.Answer = answer
 	return r, err
 }
+
 func containsOne(text string, needles []string) bool {
 	for _, s := range needles {
 		if strings.Contains(text, s) {
@@ -184,6 +208,7 @@ func (e *Engine) SetRouting(cfg RoutingConfig) error {
 	e.routing.Store(p)
 	return nil
 }
+
 func (e *Engine) policy() *RoutingPolicy {
 	if p := e.routing.Load(); p != nil {
 		return p
@@ -212,8 +237,18 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		}
 		decision.ticket = ticket
 		decision.prepared = true
+		e.lastLLM.Store(decision.Route == "llm")
 	}()
 	p := e.policy()
+	now := time.Now().UnixNano()
+	// A pending claim from the wake-word daemon overrides text-based routing for
+	// this one turn only. Context from earlier turns still comes from memory.
+	if cu := e.claimUntil.Load(); cu != 0 && now < cu && e.claimUntil.CompareAndSwap(cu, 0) {
+		if e.claimNewChat.Load() {
+			e.dialogue().Clear(ctx, ticket)
+		}
+		return RouteDecision{Route: "llm", Source: "control_claim"}
+	}
 	if isRetryCommand(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue_retry"}
 	}
@@ -229,7 +264,7 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		}
 		return d
 	}
-	if len(snapshot.Messages) > 0 && dialogue.IsFollowup(text) {
+	if len(snapshot.Messages) > 0 && e.lastLLM.Load() && dialogue.IsFollowup(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue"}
 	}
 	if p.defaultRoute != "classify" {
